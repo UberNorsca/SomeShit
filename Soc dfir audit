@@ -1,0 +1,99 @@
+
+# SOC / DFIR Pentest-Level Script (Advanced)
+# Проверка на сложные индикаторы атак, persistence, LOLbins и backdoors
+# Output: JSON report in C:\Users\Public\soc_advanced_report
+
+$OutputDir = "C:\Users\Public\soc_advanced_report"
+if (!(Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
+
+$Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+$ReportFile = "$OutputDir\soc_advanced_report_$Timestamp.json"
+
+$Report = [ordered]@{}
+
+# -------------------------
+# System Info & Users
+# -------------------------
+$Report.SystemInfo = Get-ComputerInfo | Select-Object CsName, WindowsProductName, WindowsVersion, OsArchitecture
+$Report.LoggedUsers = query user 2>$null
+$Report.LocalAdmins = Get-LocalGroupMember -Group "Administrators" 2>$null | Select-Object Name, ObjectClass
+
+# -------------------------
+# Security Event Logs
+# -------------------------
+$Report.FailedLogons = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4625; StartTime=(Get-Date).AddHours(-24)} -ErrorAction SilentlyContinue | Select TimeCreated, Id, Message
+$Report.NewUsers = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4720; StartTime=(Get-Date).AddDays(-7)} -ErrorAction SilentlyContinue | Select TimeCreated, Message
+$Report.PrivilegedOps = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4673; StartTime=(Get-Date).AddHours(-24)} -ErrorAction SilentlyContinue | Select TimeCreated, Message
+
+# -------------------------
+# Persistence & Autoruns
+# -------------------------
+$RunKeys = @("HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+"HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+"HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+"HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce")
+
+$StartupItems = @()
+foreach ($key in $RunKeys) {
+    if (Test-Path $key) {
+        $items = Get-ItemProperty $key
+        $items.PSObject.Properties | Where-Object {$_.MemberType -eq "NoteProperty"} | ForEach-Object {
+            $StartupItems += [pscustomobject]@{Location=$key; Name=$_.Name; Value=$_.Value}
+        }
+    }
+}
+$Report.StartupPersistence = $StartupItems
+
+$Report.Services = Get-WmiObject Win32_Service | Select Name, DisplayName, State, StartMode, PathName
+$Report.ScheduledTasks = Get-ScheduledTask | Select TaskName, TaskPath, State
+try { $Report.WMIEvents = Get-WmiObject -Namespace root\subscription -Class __EventFilter } catch {}
+
+# -------------------------
+# Network & Reverse Shell Indicators
+# -------------------------
+$Report.NetworkConnections = Get-NetTCPConnection -ErrorAction SilentlyContinue | Select LocalAddress, LocalPort, RemoteAddress, RemotePort, State, OwningProcess
+$Report.ListeningPorts = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select LocalAddress, LocalPort, OwningProcess
+$SuspiciousConnections = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | Where-Object { $_.RemoteAddress -notlike "127.*" -and $_.RemoteAddress -ne "0.0.0.0" }
+$Report.PossibleReverseShell = $SuspiciousConnections | Select LocalAddress, LocalPort, RemoteAddress, RemotePort, OwningProcess
+
+# -------------------------
+# Recently Modified & Suspicious Files
+# -------------------------
+$Report.RecentExecutables = Get-ChildItem "C:\Users" -Recurse -Include *.exe -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-3) } | Select FullName, LastWriteTime
+$TempPaths = @("$env:TEMP","C:\Windows\Temp")
+$DLLs = @()
+foreach ($path in $TempPaths) {
+    if (Test-Path $path) {
+        $DLLs += Get-ChildItem $path -Recurse -Include *.dll -ErrorAction SilentlyContinue | Select FullName, LastWriteTime
+    }
+}
+$Report.TempDLLs = $DLLs
+
+# -------------------------
+# Credential Dumping Indicators
+# -------------------------
+$Report.LSASSAccess = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4673; StartTime=(Get-Date).AddHours(-24)} -ErrorAction SilentlyContinue | Select TimeCreated, Message
+
+# -------------------------
+# Advanced IOC Checks
+# -------------------------
+# Example: search for Cobalt Strike, Empire, Meterpreter, PowerShell backdoors, LOLbins
+$PathsToCheck = @("C:\Windows\System32", "$env:TEMP", "C:\Users\Public")
+$Patterns = @("beacon\.exe","empire\.exe","meterpreter",".*\.ps1","Invoke-.*","powershell\s.*-enc")
+$AdvIOCs = @()
+foreach ($path in $PathsToCheck) {
+    foreach ($pattern in $Patterns) {
+        $matches = Get-ChildItem $path -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $pattern }
+        foreach ($m in $matches) { $AdvIOCs += [pscustomobject]@{Path=$m.FullName; Name=$m.Name} }
+    }
+}
+$Report.AdvancedIOCs = $AdvIOCs
+
+# -------------------------
+# Save Report
+# -------------------------
+$Report | ConvertTo-Json -Depth 8 | Out-File $ReportFile -Encoding UTF8
+
+Write-Host ""
+Write-Host "Advanced SOC/DFIR triage completed."
+Write-Host "Report saved to:" $ReportFile
