@@ -6,7 +6,9 @@ param(
     [int]$RecentFileDays = 3,
     [int]$MaxEventsPerQuery = 500,
     [int]$MaxItemsPerSection = 1000,
-    [switch]$SkipDeepFileScan
+    [int]$EventMessageLength = 500,
+    [switch]$SkipDeepFileScan,
+    [switch]$NoSummaryReport
 )
 
 Set-StrictMode -Version Latest
@@ -49,7 +51,7 @@ function Get-EventData {
     param(
         [Parameter(Mandatory)] [hashtable]$Filter,
         [int]$MaxEvents = 300,
-        [int]$MaxMessageLength = 1200
+        [int]$MaxMessageLength = 500
     )
 
     $events = $null
@@ -70,12 +72,16 @@ function Get-EventData {
     $events |
         ForEach-Object {
             $msg = $_.Message
+            if ($msg) {
+                $msg = $msg -replace "`r`n", "`n"
+            }
+
             if ($msg -and $msg.Length -gt $MaxMessageLength) {
                 $msg = $msg.Substring(0, $MaxMessageLength) + '...'
             }
 
             [pscustomobject]@{
-                TimeCreated = $_.TimeCreated
+                TimeCreated = if ($_.TimeCreated) { $_.TimeCreated.ToUniversalTime().ToString('o') } else { $null }
                 Id = $_.Id
                 RecordId = $_.RecordId
                 Provider = $_.ProviderName
@@ -83,6 +89,142 @@ function Get-EventData {
                 Message = $msg
             }
         }
+}
+
+function Convert-ToJsonFriendlyObject {
+    param([object]$InputObject)
+
+    if ($null -eq $InputObject) { return $null }
+
+    if ($InputObject -is [DateTime]) {
+        return $InputObject.ToUniversalTime().ToString('o')
+    }
+
+    if ($InputObject -is [DateTimeOffset]) {
+        return $InputObject.ToUniversalTime().ToString('o')
+    }
+
+    if ($InputObject -is [Enum]) {
+        return [string]$InputObject
+    }
+
+    if (
+        $InputObject -is [string] -or
+        $InputObject.GetType().IsPrimitive -or
+        $InputObject -is [decimal] -or
+        $InputObject -is [guid]
+    ) {
+        return $InputObject
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $dictOut = [ordered]@{}
+        foreach ($key in $InputObject.Keys) {
+            $dictOut[$key] = Convert-ToJsonFriendlyObject -InputObject $InputObject[$key]
+        }
+        return $dictOut
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string])) {
+        $listOut = New-Object System.Collections.Generic.List[object]
+        foreach ($item in $InputObject) {
+            $listOut.Add((Convert-ToJsonFriendlyObject -InputObject $item))
+        }
+        return ,$listOut.ToArray()
+    }
+
+    $props = @($InputObject.PSObject.Properties)
+    if ($props.Count -eq 0) {
+        return $InputObject
+    }
+
+    $objOut = [ordered]@{}
+    foreach ($prop in $props) {
+        if ($prop.MemberType -notin @('NoteProperty', 'Property', 'ScriptProperty')) { continue }
+        $objOut[$prop.Name] = Convert-ToJsonFriendlyObject -InputObject $prop.Value
+    }
+
+    return $objOut
+}
+
+function Write-HumanSummary {
+    param(
+        [Parameter(Mandatory)] [object]$Report,
+        [Parameter(Mandatory)] [string]$Path
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    $meta = $Report.Metadata
+    $summary = $Report.Summary
+
+    $lines.Add('# SOC/DFIR Triage Summary')
+    $lines.Add('')
+    $lines.Add(('Host: {0}' -f $meta.Hostname))
+    $lines.Add(('Generated (UTC): {0}' -f $meta.GeneratedAtUtc))
+    $lines.Add(('Duration (seconds): {0}' -f $meta.DurationSeconds))
+    $lines.Add('')
+
+    $lines.Add('## Counters')
+    $lines.Add(('- Failed logons: {0}' -f $summary.FailedLogons))
+    $lines.Add(('- New users: {0}' -f $summary.NewUsers))
+    $lines.Add(('- Startup registry entries: {0}' -f $summary.StartupRegistryEntries))
+    $lines.Add(('- Suspicious services: {0}' -f $summary.SuspiciousServices))
+    $lines.Add(('- External established connections: {0}' -f $summary.ExternalEstablishedConnections))
+    $lines.Add(('- Recent suspicious files: {0}' -f $summary.RecentSuspiciousFiles))
+    $lines.Add(('- IOC name matches: {0}' -f $summary.IOCNameMatches))
+    $lines.Add(('- IOC content matches: {0}' -f $summary.IOCContentMatches))
+    $lines.Add(('- Section errors: {0}' -f $summary.SectionErrors))
+    $lines.Add('')
+
+    $lines.Add('## Top External Connections')
+    $connections = @($Report.Network.PossibleReverseShell | Select-Object -First 20)
+    if ($connections.Count -eq 0) {
+        $lines.Add('- None')
+    }
+    else {
+        foreach ($conn in $connections) {
+            $lines.Add(('- {0}:{1} -> {2}:{3} | PID {4} | {5}' -f $conn.LocalAddress, $conn.LocalPort, $conn.RemoteAddress, $conn.RemotePort, $conn.OwningProcessId, $conn.ProcessName))
+        }
+    }
+    $lines.Add('')
+
+    $lines.Add('## Top Suspicious Services')
+    $services = @($Report.Persistence.SuspiciousServices | Select-Object -First 20)
+    if ($services.Count -eq 0) {
+        $lines.Add('- None')
+    }
+    else {
+        foreach ($svc in $services) {
+            $lines.Add(('- {0} ({1}) | {2}' -f $svc.Name, $svc.State, $svc.PathName))
+        }
+    }
+    $lines.Add('')
+
+    $lines.Add('## Top IOC Content Matches')
+    $iocHits = @($Report.AdvancedIOC.ScriptContentMatches | Select-Object -First 20)
+    if ($iocHits.Count -eq 0) {
+        $lines.Add('- None')
+    }
+    else {
+        foreach ($hit in $iocHits) {
+            $lines.Add(('- {0}:{1} | {2}' -f $hit.FullName, $hit.LineNumber, $hit.Pattern))
+        }
+    }
+    $lines.Add('')
+
+    $lines.Add('## Section Errors')
+    $errors = @($Report.SectionErrors)
+    if ($errors.Count -eq 0) {
+        $lines.Add('- None')
+    }
+    else {
+        foreach ($err in $errors) {
+            $lines.Add(('- {0}: {1}' -f $err.Section, $err.Error))
+        }
+    }
+
+    Set-Content -Path $Path -Value ($lines -join "`r`n") -Encoding UTF8
 }
 
 function Test-IsExternalAddress {
@@ -116,6 +258,7 @@ if (-not (Test-Path -LiteralPath $OutputDir)) {
 
 $timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
 $reportFile = Join-Path $OutputDir ("soc_advanced_report_{0}.json" -f $timestamp)
+$summaryFile = Join-Path $OutputDir ("soc_advanced_report_{0}_summary.md" -f $timestamp)
 
 $isAdmin = Invoke-Section -Name 'AdminCheck' -DefaultValue $false -ScriptBlock {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -148,7 +291,9 @@ $report.Metadata = [ordered]@{
         RecentFileDays = $RecentFileDays
         MaxEventsPerQuery = $MaxEventsPerQuery
         MaxItemsPerSection = $MaxItemsPerSection
+        EventMessageLength = $EventMessageLength
         SkipDeepFileScan = [bool]$SkipDeepFileScan
+        NoSummaryReport = [bool]$NoSummaryReport
     }
 }
 
@@ -178,15 +323,15 @@ $now = Get-Date
 $report.SecurityEvents = [ordered]@{}
 
 $report.SecurityEvents.FailedLogons = Invoke-Section -Name 'SecurityEvents.FailedLogons' -DefaultValue @() -ScriptBlock {
-    Get-EventData -Filter @{ LogName = 'Security'; Id = 4625; StartTime = $now.AddHours(-$SecurityHours) } -MaxEvents $MaxEventsPerQuery
+    Get-EventData -Filter @{ LogName = 'Security'; Id = 4625; StartTime = $now.AddHours(-$SecurityHours) } -MaxEvents $MaxEventsPerQuery -MaxMessageLength $EventMessageLength
 }
 
 $report.SecurityEvents.NewUsers = Invoke-Section -Name 'SecurityEvents.NewUsers' -DefaultValue @() -ScriptBlock {
-    Get-EventData -Filter @{ LogName = 'Security'; Id = 4720; StartTime = $now.AddDays(-$NewUsersDays) } -MaxEvents $MaxEventsPerQuery
+    Get-EventData -Filter @{ LogName = 'Security'; Id = 4720; StartTime = $now.AddDays(-$NewUsersDays) } -MaxEvents $MaxEventsPerQuery -MaxMessageLength $EventMessageLength
 }
 
 $report.SecurityEvents.PrivilegedOps = Invoke-Section -Name 'SecurityEvents.PrivilegedOps' -DefaultValue @() -ScriptBlock {
-    Get-EventData -Filter @{ LogName = 'Security'; Id = 4673; StartTime = $now.AddHours(-$SecurityHours) } -MaxEvents $MaxEventsPerQuery
+    Get-EventData -Filter @{ LogName = 'Security'; Id = 4673; StartTime = $now.AddHours(-$SecurityHours) } -MaxEvents $MaxEventsPerQuery -MaxMessageLength $EventMessageLength
 }
 
 $runKeys = @(
@@ -435,7 +580,7 @@ $report.FileFindings.TempDlls = Invoke-Section -Name 'FileFindings.TempDlls' -De
 $report.CredentialDumping = [ordered]@{}
 
 $report.CredentialDumping.Security4656Lsass = Invoke-Section -Name 'CredentialDumping.Security4656Lsass' -DefaultValue @() -ScriptBlock {
-    Get-EventData -Filter @{ LogName = 'Security'; Id = 4656; StartTime = $now.AddHours(-$SecurityHours) } -MaxEvents $MaxEventsPerQuery |
+    Get-EventData -Filter @{ LogName = 'Security'; Id = 4656; StartTime = $now.AddHours(-$SecurityHours) } -MaxEvents $MaxEventsPerQuery -MaxMessageLength $EventMessageLength |
         Where-Object { $_.Message -match '(?i)lsass\.exe' }
 }
 
@@ -444,7 +589,7 @@ $report.CredentialDumping.SysmonProcessAccessLsass = Invoke-Section -Name 'Crede
         return @()
     }
 
-    Get-EventData -Filter @{ LogName = 'Microsoft-Windows-Sysmon/Operational'; Id = 10; StartTime = $now.AddHours(-$SecurityHours) } -MaxEvents $MaxEventsPerQuery |
+    Get-EventData -Filter @{ LogName = 'Microsoft-Windows-Sysmon/Operational'; Id = 10; StartTime = $now.AddHours(-$SecurityHours) } -MaxEvents $MaxEventsPerQuery -MaxMessageLength $EventMessageLength |
         Where-Object { $_.Message -match '(?i)lsass\.exe' }
 }
 
@@ -557,14 +702,25 @@ $report.Summary = [ordered]@{
 $report.SectionErrors = $sectionErrors
 $report.Metadata.DurationSeconds = [math]::Round(((Get-Date) - $scriptStart).TotalSeconds, 2)
 
-$report | ConvertTo-Json -Depth 12 | Out-File -FilePath $reportFile -Encoding utf8
+$jsonReadyReport = Convert-ToJsonFriendlyObject -InputObject $report
+$json = $jsonReadyReport | ConvertTo-Json -Depth 20
+$json = $json -replace '\\u003c', '<' -replace '\\u003e', '>' -replace '\\u0026', '&'
+Set-Content -Path $reportFile -Value $json -Encoding UTF8
+
+$summaryWritten = $false
+if (-not $NoSummaryReport) {
+    Write-HumanSummary -Report $jsonReadyReport -Path $summaryFile
+    $summaryWritten = $true
+}
 
 Write-Host ''
 Write-Host 'Advanced SOC/DFIR triage completed.'
-Write-Host ('Report saved to: {0}' -f $reportFile)
+Write-Host ('JSON report saved to: {0}' -f $reportFile)
+if ($summaryWritten) {
+    Write-Host ('Summary report saved to: {0}' -f $summaryFile)
+}
+
 if ($sectionErrors.Count -gt 0) {
     Write-Warning ('Some sections failed. See SectionErrors in JSON report. Count: {0}' -f $sectionErrors.Count)
 }
-
-
 
